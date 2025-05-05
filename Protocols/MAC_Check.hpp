@@ -145,6 +145,15 @@ void Tree_MAC_Check<U>::AddToCheck(const U& share, const T& value, const Player&
 
 
 template<class U>
+void mac_fail_remove(const Player& P)
+{
+  unlink(
+      mac_filename<typename U::mac_key_type>(
+          get_prep_sub_dir<U>(P.num_players()), P.my_num()).c_str());
+  throw mac_fail();
+}
+
+template<class U>
 void MAC_Check_<U>::Check(const Player& P)
 {
   assert(U::mac_type::invertible);
@@ -180,7 +189,7 @@ void MAC_Check_<U>::Check(const Player& P)
             if (&os != &bundle.mine)
               delta += os.get<typename U::mac_type>();
           if (delta != 0)
-            throw mac_fail();
+            mac_fail_remove<U>(P);
         }
     }
   else
@@ -221,7 +230,7 @@ void MAC_Check_<U>::Check(const Player& P)
       for (int i=0; i<P.num_players(); i++)
         { t += tau[i]; }
       if (t != 0)
-        throw mac_fail();
+        mac_fail_remove<U>(P);
     }
 
   vals.erase(vals.begin(), vals.begin() + popen_cnt);
@@ -332,7 +341,8 @@ void MAC_Check_Z2k<T, U, V, W>::Check(const Player& P)
   this->vals.erase(this->vals.begin(), this->vals.begin() + this->popen_cnt);
   this->macs.erase(this->macs.begin(), this->macs.begin() + this->popen_cnt);
   this->popen_cnt=0;
-  if (!zj_sum.is_zero()) { throw mac_fail(); }
+  if (!zj_sum.is_zero())
+    mac_fail_remove<W>(P);
 }
 
 
