@@ -4853,6 +4853,50 @@ class _fix(_single):
         assert self.f == other.f
         self.v.update(other.v)
 
+    @vectorized_classmethod
+    def get_random(cls, lower, upper, symmetric=True, public_randomness=False):
+        """ Uniform secret random number around centre of bounds.
+        Actual range can be smaller but never larger.
+
+        :param lower: float
+        :param upper: float
+        :param symmetric: symmetric distribution at higher cost
+        :param public_randomness: use public randomness (avoids preprocessing)
+        :param size: vector size (int, default 1)
+        """
+        if public_randomness:
+            get_random_int = regint.get_random
+            get_random_bit = lambda: regint.get_random(1)
+        else:
+            get_random_int = cls.int_type.get_random_int
+            get_random_bit = cls.int_type.get_random_bit
+        f = cls.f
+        k = cls.k
+        log_range = int(math.log(upper - lower, 2))
+        n_bits = log_range + cls.f
+        gen_range = (2 ** (n_bits) - 1) / 2 ** cls.f
+        diff = upper - lower
+        factor = diff / gen_range
+        real = lambda x: cfix.int_rep(x, f, k) * 2 ** -f
+        real_range = real(real(factor) * gen_range)
+        average = lower + 0.5 * (upper - lower)
+        lower = average - 0.5 * real_range
+        upper = average + 0.5 * real_range
+        r = cls._new(get_random_int(n_bits)) * factor + lower
+        if symmetric:
+            lowest = math.floor(lower * 2 ** cls.f) / 2 ** cls.f
+            highest = math.ceil(upper * 2 ** cls.f) / 2 ** cls.f
+            if program.verbose:
+                print('randomness range [%f,%f], '
+                      'fringes half the probability' % \
+                      (lowest, highest))
+            return get_random_bit().if_else(r, -r + 2 * average)
+        else:
+            if program.verbose:
+                print('randomness range [%f,%f], %d bits' % \
+                      (real(lower), real(lower) + real_range, n_bits))
+            return r
+
 class sfix(_fix):
     """ Secret fixed-point number represented as secret integer, by
     multiplying with ``2^f`` and then rounding. See :py:class:`sint`
@@ -4903,50 +4947,6 @@ class sfix(_fix):
     @vectorized_classmethod
     def get_raw_input_from(cls, player):
         return cls._new(cls.int_type.get_raw_input_from(player))
-
-    @vectorized_classmethod
-    def get_random(cls, lower, upper, symmetric=True, public_randomness=False):
-        """ Uniform secret random number around centre of bounds.
-        Actual range can be smaller but never larger.
-
-        :param lower: float
-        :param upper: float
-        :param symmetric: symmetric distribution at higher cost
-        :param public_randomness: use public randomness (avoids preprocessing)
-        :param size: vector size (int, default 1)
-        """
-        if public_randomness:
-            get_random_int = regint.get_random
-            get_random_bit = lambda: regint.get_random(1)
-        else:
-            get_random_int = cls.int_type.get_random_int
-            get_random_bit = cls.int_type.get_random_bit
-        f = cls.f
-        k = cls.k
-        log_range = int(math.log(upper - lower, 2))
-        n_bits = log_range + cls.f
-        gen_range = (2 ** (n_bits) - 1) / 2 ** cls.f
-        diff = upper - lower
-        factor = diff / gen_range
-        real = lambda x: cfix.int_rep(x, f, k) * 2 ** -f
-        real_range = real(real(factor) * gen_range)
-        average = lower + 0.5 * (upper - lower)
-        lower = average - 0.5 * real_range
-        upper = average + 0.5 * real_range
-        r = cls._new(get_random_int(n_bits)) * factor + lower
-        if symmetric:
-            lowest = math.floor(lower * 2 ** cls.f) / 2 ** cls.f
-            highest = math.ceil(upper * 2 ** cls.f) / 2 ** cls.f
-            if program.verbose:
-                print('randomness range [%f,%f], '
-                      'fringes half the probability' % \
-                      (lowest, highest))
-            return get_random_bit().if_else(r, -r + 2 * average)
-        else:
-            if program.verbose:
-                print('randomness range [%f,%f], %d bits' % \
-                      (real(lower), real(lower) + real_range, n_bits))
-            return r
 
     @classmethod
     def direct_matrix_mul(cls, A, B, n, m, l, reduce=True, indices=None):

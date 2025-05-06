@@ -841,6 +841,16 @@ class sbitvec(_vec, _bit, _binary):
                 return self.from_vec(x.zero_if_not(condition) for x in self.v)
             def __str__(self):
                 return 'sbitvec(%d)' % n
+            @classmethod
+            def get_random_int(cls, n_bits):
+                assert instructions_base.get_global_vector_size() == 1
+                return cls.from_vec(
+                    [sbit.get_random_bit() for i in range(n_bits)] + \
+                    [0] * (n - n_bits))
+            @staticmethod
+            def get_random_bit():
+                assert instructions_base.get_global_vector_size() == 1
+                return sbit.get_random_bit()
         sbitvecn.basic_type = sbitvecn
         sbitvecn.reg_type = 'sb'
         return sbitvecn
