@@ -6386,6 +6386,9 @@ class Array(_vectorizable):
         :param other: vector or container of same length and type that supports operations with type of this array """
         return self.get_vector() / value
 
+    def __rtruediv__(self, value):
+        return value / self.get_vector()
+
     def __pow__(self, value):
         """ Vector power-of computation.
 
