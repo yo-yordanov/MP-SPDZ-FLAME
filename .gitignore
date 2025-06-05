@@ -124,3 +124,6 @@ _build/
 # temp doc files
 doc/readme.md
 doc/xml
+
+#FLAME python environment
+/flame_env
