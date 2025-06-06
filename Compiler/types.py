@@ -5148,6 +5148,11 @@ class sfix(_fix):
     def __repr__(self):
         return '<sfix{f=%d,k=%d} at %s>' % (self.f, self.k, self.v)
 
+    def output(self):
+        library.print_str(
+            '<sfix{f=%d,k=%d,v=%s}>' % (self.f, self.k, '%s'), self.v,
+            print_secrets=True)
+
 class unreduced_sfix(_single):
     int_type = sint
 
@@ -5827,6 +5832,11 @@ class sfloat(_number, _secret_structure):
         other = self.coerce(other)
         f = lambda x: type(self)(*x)
         return f, sint(list(self)), sint(list(other))
+
+    def output(self):
+        library.print_str(
+            '<sfloat{v=%s,p=%s,z=%s,s=%s}>', self.v, self.p, self.z, self.s,
+            print_secrets=True)
 
 class cfloat(Tape._no_truth):
     """ Helper class for printing revealed sfloats. """
