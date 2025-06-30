@@ -1,0 +1,96 @@
+# coding: latin-1
+
+from Compiler.types import sint, regint, Array, MemValue
+from Compiler.library import print_ln, do_while, for_range
+from Compiler.util import if_else
+
+PORTNUM = 14000
+MAX_NUM_CLIENTS = 3
+MODEL_SIZE = 5
+PRECISION = 32
+n_rounds = 0
+n_threads = 2
+
+sfix.set_precision(PRECISION)
+
+if len(program.args) > 1:
+    n_rounds = int(program.args[1])
+
+if len(program.args) > 2:
+    program.active = bool(int(program.args[2]))
+
+def accept_client():
+    client_socket_id = accept_client_connection(PORTNUM)
+    last = regint.read_from_socket(client_socket_id)
+    return client_socket_id, last
+
+def close_connections(number_clients):
+    @for_range(number_clients)
+    def _(i):
+        closeclientconnection(i)
+
+def client_input(t, client_socket_id):
+    """
+    Receive random model update from client.
+    """
+    
+    return t.receive_from_client(MODEL_SIZE, client_socket_id)
+
+def main():
+    """Listen in while loop for players to join a game.
+    Once maxiumum reached or have notified that round finished, run comparison and return result."""
+    # Start listening for client socket connections
+    listen_for_clients(PORTNUM)
+    print_ln('Listening for client connections on base port %s', PORTNUM)
+
+    def iteration(_=None):
+        print_ln('Starting a new round of the game.')
+
+        # Clients socket id (integer).
+        client_sockets = Array(MAX_NUM_CLIENTS, regint)
+        # Number of clients
+        number_clients = MemValue(regint(0))
+        # Client ids to identity client
+        client_ids = Array(MAX_NUM_CLIENTS, sint)
+        # Keep track of received inputs
+        seen = Array(MAX_NUM_CLIENTS, regint)
+        seen.assign_all(0)
+
+        # Loop round waiting for each client to connect
+        @do_while
+        def client_connections():
+            client_id, last = accept_client()
+            @if_(client_id >= MAX_NUM_CLIENTS)
+            def _():
+                print_ln('client id too high')
+                crash()
+            client_sockets[client_id] = client_id
+            client_ids[client_id] = client_id
+            seen[client_id] = 1
+            @if_(last == 1)
+            def _():
+                number_clients.write(client_id + 1)
+
+            return (sum(seen) < number_clients) + (number_clients == 0)
+
+        # Clients secret input.
+        client_values = sfix.Matrix(MAX_NUM_CLIENTS, MODEL_SIZE)
+
+        @for_range_multithread(n_threads, 1, number_clients)
+        def _(client_id):
+            client_values[client_id] = client_input(sfix, client_id)
+
+        # client_values.print_reveal_nested()
+
+        close_connections(number_clients)
+
+        return True
+
+    if n_rounds > 0:
+        print('run %d rounds' % n_rounds)
+        for_range(n_rounds)(iteration)
+    else:
+        print('run forever')
+        do_while(iteration)
+
+main()
