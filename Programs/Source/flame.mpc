@@ -1,8 +1,9 @@
 # coding: latin-1
 
 from Compiler.types import sint, regint, Array, MemValue
-from Compiler.library import print_ln, do_while, for_range
+from Compiler.library import print_ln, do_while, for_range, tree_reduce, for_range_multithread
 from Compiler.util import if_else
+from Compiler.mpc_math import sqrt
 
 PORTNUM = 14000
 MAX_NUM_CLIENTS = 3
@@ -80,7 +81,36 @@ def main():
         def _(client_id):
             client_values[client_id] = client_input(sfix, client_id)
 
-        # client_values.print_reveal_nested()
+        # revealed_client_values = client_values.reveal_nested()
+        # print_ln('%s', revealed_client_values)
+
+        # Compute L2 norm of each client's input.
+        norms = sfix.Array(MAX_NUM_CLIENTS)
+        @for_range_multithread(n_threads, 1, number_clients)
+        def _(client_id):
+            acc = tree_reduce(lambda x, y: x + y, client_values[client_id]*client_values[client_id])
+            norms[client_id] = sqrt(acc)
+        
+        # revealed_norms = norms.reveal()
+        # print_ln('Norms: %s', revealed_norms)
+
+        # Compute cosine similarity between all client pairs.
+        cosine_similarities = sfix.Matrix(MAX_NUM_CLIENTS, MAX_NUM_CLIENTS)
+        @for_range_multithread(n_threads, 1, number_clients)
+        def _(i):
+            @for_range(number_clients)
+            def _(j):
+                @if_e(i < j)
+                def _():
+                    dot_product = tree_reduce(lambda x, y: x + y, client_values[i] * client_values[j])
+                    cosine_similarities[i][j] = dot_product / (norms[i] * norms[j])
+                    cosine_similarities[j][i] = cosine_similarities[i][j]
+                @else_
+                def _():
+                    cosine_similarities[i][j] = sfix(0)
+
+        # revealed_cosine_similarities = cosine_similarities.reveal_nested()
+        # print_ln('Cosine similarities: %s', revealed_cosine_similarities)
 
         close_connections(number_clients)
 
