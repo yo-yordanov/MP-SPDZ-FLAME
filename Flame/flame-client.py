@@ -26,9 +26,12 @@ for socket in client.sockets:
 
 def run(n, p):
     """
-    Generate and send random model update with n weights and precision p to all clients.
+    Generate and send random model update with n weights and precision p to all parties.
+    Args:
+        n (int): Number of weights in the model.
+        p (int): Precision for the weights.
     """
-    model = [random.uniform(-1, 1) for _ in range(model_size)]
+    model = [random.uniform(-1, 1) for _ in range(n)]
 
     # norm = np.linalg.norm(model)
     # print(f"Client {client_id} sending model: {model} with norm {norm}")

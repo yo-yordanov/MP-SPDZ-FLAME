@@ -1,126 +1,322 @@
 # coding: latin-1
 
-from Compiler.types import sint, regint, Array, MemValue
-from Compiler.library import print_ln, do_while, for_range, tree_reduce, for_range_multithread
-from Compiler.util import if_else
+from Compiler.types import sint, sfix, regint, Array, MemValue, cint, cfix
+from Compiler.library import (
+    listen_for_clients,
+    accept_client_connection,
+    crash,
+    print_ln,
+    do_while,
+    for_range,
+    for_range_multithread,
+    if_,
+)
+from Compiler.instructions import closeclientconnection
 from Compiler.mpc_math import sqrt
+from Compiler.path_oblivious_heap import PathObliviousHeap
 
 PORTNUM = 14000
-MAX_NUM_CLIENTS = 3
+N_THREADS = 2
+N_ITERATIONS = 1
+MAX_CLIENTS = 3
 MODEL_SIZE = 5
 PRECISION = 32
-n_rounds = 0
-n_threads = 2
 
 sfix.set_precision(PRECISION)
+cfix.set_precision(PRECISION)
+
+EPSILON = MemValue(cfix(0.5))
+MIN_PTS = MemValue(cint(2))
 
 if len(program.args) > 1:
-    n_rounds = int(program.args[1])
-
-if len(program.args) > 2:
     program.active = bool(int(program.args[2]))
 
+
 def accept_client():
+    """
+    Accept a client connection and read the client id and last flag.
+    Returns:
+        client_socket_id (int): The socket id of the connected client.
+        last (int): A flag indicating if this is the last client.
+    """
     client_socket_id = accept_client_connection(PORTNUM)
     last = regint.read_from_socket(client_socket_id)
     return client_socket_id, last
 
+
+def accept_clients():
+    """
+    Accept clients until the maximum number of clients is reached or last client is connected.
+    Returns:
+        n_clients (MemValue): The number of clients that have connected.
+    """
+    # Clients socket id (integer).
+    sockets = Array(MAX_CLIENTS, regint)
+    # Number of clients
+    n_clients = MemValue(regint(0))
+    # Client ids to identity client
+    client_ids = Array(MAX_CLIENTS, sint)
+    # Keep track of received inputs
+    seen = Array(MAX_CLIENTS, regint)
+    seen.assign_all(0)
+
+    @do_while
+    def _():
+        cid, last = accept_client()
+
+        @if_(cid >= MAX_CLIENTS)
+        def _():
+            print_ln("client id too high")
+            crash()
+
+        sockets[cid] = cid
+        client_ids[cid] = cid
+        seen[cid] = 1
+
+        @if_(last == 1)
+        def _():
+            n_clients.write(cid + 1)
+
+        return (sum(seen) < n_clients) + (n_clients == 0)
+
+    return n_clients
+
+
 def close_connections(number_clients):
+    """
+    Close all client connections.
+    Args:
+        number_clients (int): The number of clients that are connected.
+    """
+
     @for_range(number_clients)
     def _(i):
         closeclientconnection(i)
 
-def client_input(t, client_socket_id):
+
+def client_input(n_clients, n_threads=N_THREADS, n_parallel=1):
     """
-    Receive random model update from client.
+    Receive input vectors from clients.
+    Args:
+        n_clients (int): The actual number of clients.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        client_values (sfix.Matrix): A matrix containing the input vectors from the clients.
     """
-    
-    return t.receive_from_client(MODEL_SIZE, client_socket_id)
+    client_values = sfix.Matrix(MAX_CLIENTS, MODEL_SIZE)
+
+    @for_range_multithread(n_threads, n_parallel, n_clients)
+    def _(client_id):
+        client_values[client_id] = sfix.receive_from_client(MODEL_SIZE, client_id)
+
+    return client_values
+
+
+def compute_l2_norms(n_clients, values, n_threads=N_THREADS, n_parallel=1):
+    """
+    Compute the L2 norms of the input vectors for each client.
+    Args:
+        n_clients (int): The actual number of clients.
+        values (sfix.Matrix): The input vectors from the clients.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        sfix.Array: An array containing the L2 norms for each client.
+    """
+    norms = sfix.Array(MAX_CLIENTS)
+
+    @for_range_multithread(n_threads, n_parallel, n_clients)
+    def _(cid):
+        norm = values[cid].dot(values[cid])[0]
+        norms[cid] = sqrt(norm)
+
+    return norms
+
+
+def compute_cosine_distances(
+    n_clients, values, norms, n_threads=N_THREADS, n_parallel=1
+):
+    """
+    Compute the cosine distances between client input vectors.
+    Args:
+        n_clients (int): The actual number of clients.
+        values (sfix.Matrix): The input vectors from the clients.
+        norms (sfix.Array): The L2 norms of the input vectors.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        sfix.Matrix: A matrix containing the cosine distances for each client pair.
+    """
+    cos_distances = sfix.Matrix(MAX_CLIENTS, MAX_CLIENTS)
+
+    @for_range_multithread(n_threads, n_parallel, n_clients)
+    def _(i):
+        cos_distances[i][i] = sfix(0)
+
+        @for_range(i + 1, n_clients)
+        def _(j):
+            cos_dist = sfix(1) - values[i].dot(values[j])[0] / (norms[i] * norms[j])
+            cos_distances[i][j] = cos_distances[j][i] = cos_dist
+
+    return cos_distances
+
+
+def dbscan_init(t, n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
+    """
+    Initialize the DBSCAN algorithm variables.
+    Args:
+        t (type): The type to use for the arrays (sint or cfix).
+        n_clients (int): The actual number of clients.
+        cosine_distances (sfix.Matrix): The matrix of cosine distances between clients.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        tuple: A tuple containing initialized arrays for labels, visited, neighbors, neighbor_counts, and cluster_id.
+    """
+    labels = t.Array(MAX_CLIENTS)
+    visited = t.Array(MAX_CLIENTS)
+    neighbors = t.Matrix(MAX_CLIENTS, MAX_CLIENTS)
+    neighbor_counts = t.Array(MAX_CLIENTS)
+
+    # Initialize all arrays to zero
+    labels.assign_all(t(0))
+    visited.assign_all(t(0))
+    neighbor_counts.assign_all(t(0))
+    neighbors.assign_all(t(0))
+
+    # Precompute neighbors matrix and neighbor_counts array using multithreading
+    @for_range_multithread(n_threads, n_parallel, n_clients)
+    def _(i):
+        @for_range(n_clients)
+        def _(j):
+            is_neighbor = (i != j) * (cosine_distances[i][j] < EPSILON)
+            neighbors[i][j] = is_neighbor
+            neighbor_counts[i] = neighbor_counts[i] + is_neighbor
+
+    # Use MemValue for cluster_id to handle modifications properly
+    cluster_id = MemValue(t(0))
+
+    return labels, visited, neighbors, neighbor_counts, cluster_id
+
+
+def dbscan(n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
+    """
+    Perform the DBSCAN clustering algorithm on the revealed cosine distances.
+    Args:
+        n_clients (int): The actual number of clients.
+        cosine_distances (sfix.Matrix): The matrix of cosine distances between clients.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        cint.Array: An array containing the cluster labels for each client.
+    """
+    # Initialize DBSCAN parameters
+    labels, visited, neighbors, neighbor_counts, cluster_id = dbscan_init(
+        cint, n_clients, cosine_distances, n_threads, n_parallel
+    )
+
+    @for_range(n_clients)
+    def _(i):
+        # Check if point should start a new cluster
+        should_expand = (visited[i] == 0) * (neighbor_counts[i] >= MIN_PTS)
+
+        @if_(should_expand)
+        def expand_cluster():
+            visited[i] = cint(1)
+            current_cluster = cluster_id.read() + 1
+            cluster_id.write(current_cluster)
+
+            # Initialize queue for BFS
+            queue = cint.Array(MAX_CLIENTS)
+            queue_head = MemValue(cint(0))
+            queue_tail = MemValue(cint(1))
+            in_queue = cint.Array(MAX_CLIENTS)
+            in_queue.assign_all(cint(0))
+
+            # Add starting point to queue
+            queue[0] = i
+            in_queue[i] = cint(1)
+            labels[i] = current_cluster
+
+            # Process queue
+            @for_range(MAX_CLIENTS)  # Upper bound for queue processing
+            def _(iteration):
+                head = queue_head.read()
+                tail = queue_tail.read()
+
+                # Check if queue is not empty
+                @if_(head < tail)
+                def process_queue_item():
+                    current_point = queue[head]
+                    queue_head.write(head + 1)
+
+                    # Check all neighbors of current point
+                    @for_range(n_clients)
+                    def _(j):
+                        is_neighbor = neighbors[current_point][j]
+                        not_labeled = labels[j] == 0
+                        not_in_queue = in_queue[j] == 0
+
+                        # Label neighbor if it's unlabeled
+                        should_label = is_neighbor * not_labeled
+                        labels[j] = labels[j] + should_label * current_cluster
+
+                        # Mark as visited if it's a neighbor
+                        visited[j] = visited[j] + is_neighbor * (1 - visited[j])
+
+                        # Add to queue if it's a core point and not already in queue
+                        is_core = neighbor_counts[j] >= MIN_PTS
+                        should_add_to_queue = should_label * is_core * not_in_queue
+
+                        # Oblivious queue addition
+                        current_tail = queue_tail.read()
+
+                        @if_(should_add_to_queue)
+                        def add_to_queue():
+                            queue[current_tail] = j
+                            in_queue[j] = cint(1)
+                            queue_tail.write(current_tail + 1)
+
+    return labels
+
 
 def main():
-    """Listen in while loop for players to join a game.
-    Once maxiumum reached or have notified that round finished, run comparison and return result."""
     # Start listening for client socket connections
     listen_for_clients(PORTNUM)
-    print_ln('Listening for client connections on base port %s', PORTNUM)
+    print_ln("Listening for client connections on base port %s", PORTNUM)
 
     def iteration(_=None):
-        print_ln('Starting a new round of the game.')
+        print_ln("Starting a new iteration.")
 
-        # Clients socket id (integer).
-        client_sockets = Array(MAX_NUM_CLIENTS, regint)
-        # Number of clients
-        number_clients = MemValue(regint(0))
-        # Client ids to identity client
-        client_ids = Array(MAX_NUM_CLIENTS, sint)
-        # Keep track of received inputs
-        seen = Array(MAX_NUM_CLIENTS, regint)
-        seen.assign_all(0)
-
-        # Loop round waiting for each client to connect
-        @do_while
-        def client_connections():
-            client_id, last = accept_client()
-            @if_(client_id >= MAX_NUM_CLIENTS)
-            def _():
-                print_ln('client id too high')
-                crash()
-            client_sockets[client_id] = client_id
-            client_ids[client_id] = client_id
-            seen[client_id] = 1
-            @if_(last == 1)
-            def _():
-                number_clients.write(client_id + 1)
-
-            return (sum(seen) < number_clients) + (number_clients == 0)
-
-        # Clients secret input.
-        client_values = sfix.Matrix(MAX_NUM_CLIENTS, MODEL_SIZE)
-
-        @for_range_multithread(n_threads, 1, number_clients)
-        def _(client_id):
-            client_values[client_id] = client_input(sfix, client_id)
-
-        # revealed_client_values = client_values.reveal_nested()
-        # print_ln('%s', revealed_client_values)
+        # Accept clients and read their inputs.
+        n_clients = accept_clients()
+        client_values = client_input(n_clients)
+        # print_ln("Client values: %s", client_values.reveal_nested())
 
         # Compute L2 norm of each client's input.
-        norms = sfix.Array(MAX_NUM_CLIENTS)
-        @for_range_multithread(n_threads, 1, number_clients)
-        def _(client_id):
-            acc = tree_reduce(lambda x, y: x + y, client_values[client_id]*client_values[client_id])
-            norms[client_id] = sqrt(acc)
-        
-        # revealed_norms = norms.reveal()
-        # print_ln('Norms: %s', revealed_norms)
+        norms = compute_l2_norms(n_clients, client_values)
+        # print_ln("L2 norms: %s", norms.reveal_list())
 
-        # Compute cosine similarity between all client pairs.
-        cosine_similarities = sfix.Matrix(MAX_NUM_CLIENTS, MAX_NUM_CLIENTS)
-        @for_range_multithread(n_threads, 1, number_clients)
-        def _(i):
-            @for_range(number_clients)
-            def _(j):
-                @if_e(i < j)
-                def _():
-                    dot_product = tree_reduce(lambda x, y: x + y, client_values[i] * client_values[j])
-                    cosine_similarities[i][j] = dot_product / (norms[i] * norms[j])
-                    cosine_similarities[j][i] = cosine_similarities[i][j]
-                @else_
-                def _():
-                    cosine_similarities[i][j] = sfix(0)
+        # Compute pairwise cosine distances.
+        cosine_distances = compute_cosine_distances(n_clients, client_values, norms)
+        revealed_cosine_distances = cosine_distances.reveal()
+        # print_ln("Cosine distances: %s", revealed_cosine_distances)
 
-        # revealed_cosine_similarities = cosine_similarities.reveal_nested()
-        # print_ln('Cosine similarities: %s', revealed_cosine_similarities)
+        # Cluster cosine similarities using HDBSCAN.
+        labels = dbscan(n_clients, revealed_cosine_distances)
+        # print_ln("Labels: %s", labels.reveal_list())
 
-        close_connections(number_clients)
+        close_connections(n_clients)
 
         return True
 
-    if n_rounds > 0:
-        print('run %d rounds' % n_rounds)
-        for_range(n_rounds)(iteration)
+    if N_ITERATIONS > 0:
+        print("run %d iterations" % N_ITERATIONS)
+        for_range(N_ITERATIONS)(iteration)
     else:
-        print('run forever')
+        print("run forever")
         do_while(iteration)
+
 
 main()
