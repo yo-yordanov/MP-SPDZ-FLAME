@@ -3,7 +3,7 @@
 import sys
 import random
 
-sys.path.append('.')
+sys.path.append(".")
 
 from client import *
 from domains import *
@@ -14,15 +14,16 @@ PRECISION = 32
 
 client_id = int(sys.argv[1])
 n_parties = int(sys.argv[2])
-model_size = int (sys.argv[3])
+model_size = int(sys.argv[3])
 finish = int(sys.argv[4])
 
-client = Client(['localhost'] * n_parties, 14000, client_id)
+client = Client(["localhost"] * n_parties, 14000, client_id)
 
 for socket in client.sockets:
     os = octetStream()
     os.store(finish)
     os.Send(socket)
+
 
 def run(n, p):
     """
@@ -31,12 +32,10 @@ def run(n, p):
         n (int): Number of weights in the model.
         p (int): Precision for the weights.
     """
-    model = [random.uniform(-1, 1) for _ in range(n)]
-
-    # norm = np.linalg.norm(model)
-    # print(f"Client {client_id} sending model: {model} with norm {norm}")
-
-    model = [int(x * (1 << p)) for x in model]  # Convert to int representation
+    model = [random.gauss(-1, 1) for _ in range(n)]
+    # Convert to fixed-point integer representation
+    model = [int(x * (1 << p)) for x in model]
     client.send_private_inputs(model)
+
 
 run(model_size, PRECISION)

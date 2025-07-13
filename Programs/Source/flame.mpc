@@ -1,6 +1,6 @@
 # coding: latin-1
 
-from Compiler.types import sint, sfix, regint, Array, MemValue, cint, cfix
+from Compiler.types import sint, sfix, regint, Array, Matrix, MemValue, cint, cfix
 from Compiler.library import (
     listen_for_clients,
     accept_client_connection,
@@ -12,21 +12,24 @@ from Compiler.library import (
     if_,
 )
 from Compiler.instructions import closeclientconnection
-from Compiler.mpc_math import sqrt
-from Compiler.path_oblivious_heap import PathObliviousHeap
+from Compiler.mpc_math import sqrt, log_fx, cos
+
+import math
 
 PORTNUM = 14000
 N_THREADS = 2
 N_ITERATIONS = 1
-MAX_CLIENTS = 3
+MAX_CLIENTS = 4
 MODEL_SIZE = 5
 PRECISION = 32
 
 sfix.set_precision(PRECISION)
 cfix.set_precision(PRECISION)
 
-EPSILON = MemValue(cfix(0.5))
-MIN_PTS = MemValue(cint(2))
+EPSILON = MemValue(cfix(0.6))
+DELTA = MemValue(sfix(1e-5))
+MIN_PTS = MemValue(cint(MAX_CLIENTS // 2 + 1))
+LEARNING_RATE = MemValue(sfix(0.1))
 
 if len(program.args) > 1:
     program.active = bool(int(program.args[2]))
@@ -104,7 +107,7 @@ def client_input(n_clients, n_threads=N_THREADS, n_parallel=1):
     Returns:
         client_values (sfix.Matrix): A matrix containing the input vectors from the clients.
     """
-    client_values = sfix.Matrix(MAX_CLIENTS, MODEL_SIZE)
+    client_values = Matrix(MAX_CLIENTS, MODEL_SIZE, sfix)
 
     @for_range_multithread(n_threads, n_parallel, n_clients)
     def _(client_id):
@@ -124,7 +127,7 @@ def compute_l2_norms(n_clients, values, n_threads=N_THREADS, n_parallel=1):
     Returns:
         sfix.Array: An array containing the L2 norms for each client.
     """
-    norms = sfix.Array(MAX_CLIENTS)
+    norms = Array(MAX_CLIENTS, sfix)
 
     @for_range_multithread(n_threads, n_parallel, n_clients)
     def _(cid):
@@ -148,12 +151,10 @@ def compute_cosine_distances(
     Returns:
         sfix.Matrix: A matrix containing the cosine distances for each client pair.
     """
-    cos_distances = sfix.Matrix(MAX_CLIENTS, MAX_CLIENTS)
+    cos_distances = Matrix(MAX_CLIENTS, MAX_CLIENTS, sfix).assign_all(sfix(0))
 
     @for_range_multithread(n_threads, n_parallel, n_clients)
     def _(i):
-        cos_distances[i][i] = sfix(0)
-
         @for_range(i + 1, n_clients)
         def _(j):
             cos_dist = sfix(1) - values[i].dot(values[j])[0] / (norms[i] * norms[j])
@@ -174,16 +175,10 @@ def dbscan_init(t, n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=
     Returns:
         tuple: A tuple containing initialized arrays for labels, visited, neighbors, neighbor_counts, and cluster_id.
     """
-    labels = t.Array(MAX_CLIENTS)
-    visited = t.Array(MAX_CLIENTS)
-    neighbors = t.Matrix(MAX_CLIENTS, MAX_CLIENTS)
-    neighbor_counts = t.Array(MAX_CLIENTS)
-
-    # Initialize all arrays to zero
-    labels.assign_all(t(0))
-    visited.assign_all(t(0))
-    neighbor_counts.assign_all(t(0))
-    neighbors.assign_all(t(0))
+    labels = Array(MAX_CLIENTS, t).assign_all(t(0))
+    visited = Array(MAX_CLIENTS, t).assign_all(t(0))
+    neighbors = Matrix(MAX_CLIENTS, MAX_CLIENTS, t).assign_all(t(0))
+    neighbor_counts = Array(MAX_CLIENTS, t).assign_all(t(0))
 
     # Precompute neighbors matrix and neighbor_counts array using multithreading
     @for_range_multithread(n_threads, n_parallel, n_clients)
@@ -231,8 +226,7 @@ def dbscan(n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
             queue = cint.Array(MAX_CLIENTS)
             queue_head = MemValue(cint(0))
             queue_tail = MemValue(cint(1))
-            in_queue = cint.Array(MAX_CLIENTS)
-            in_queue.assign_all(cint(0))
+            in_queue = cint.Array(MAX_CLIENTS).assign_all(cint(0))
 
             # Add starting point to queue
             queue[0] = i
@@ -240,7 +234,7 @@ def dbscan(n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
             labels[i] = current_cluster
 
             # Process queue
-            @for_range(MAX_CLIENTS)  # Upper bound for queue processing
+            @for_range(n_clients)  # Upper bound for queue processing
             def _(iteration):
                 head = queue_head.read()
                 tail = queue_tail.read()
@@ -281,6 +275,137 @@ def dbscan(n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
     return labels
 
 
+def compute_median(n_clients, norms):
+    """
+    Compute the clipping parameters for the input vectors.
+    Args:
+        n_clients (int): The actual number of clients.
+        norms (sfix.Array): The L2 norms of the input vectors.
+        lr (sfix): The learning rate to scale the median.
+    Returns:
+        MemValue: The median value of the L2 norms, scaled by the learning rate.
+    """
+    sorted_norms = Array(MAX_CLIENTS, sfix).assign(norms)
+    sorted_norms.sort()
+    median_index = (n_clients) // 2
+
+    odd_median = sorted_norms[median_index]
+    even_median = (sorted_norms[median_index - 1] + sorted_norms[median_index]) / 2
+
+    return MemValue((n_clients % 2 == 1).if_else(odd_median, even_median))
+
+
+def clip_updates(
+    n_clients,
+    client_values,
+    norms,
+    median,
+    labels,
+    n_threads=N_THREADS,
+    n_parallel=1,
+):
+    """
+    Clip gradients based on the clipping bound and aggregate them.
+    Args:
+        n_clients (int): The actual number of clients.
+        client_values (sfix.Matrix): The input vectors from clients.
+        norms (sfix.Array): The L2 norms of the input vectors.
+        median (sfix): The clipping bound value.
+        labels (cint.Array): The cluster labels for each client.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        sfix.Array: The aggregated global model update.
+    """
+    clipped_updates = Matrix(MAX_CLIENTS, MODEL_SIZE, sfix)
+
+    @for_range_multithread(n_threads, n_parallel, n_clients)
+    def _(i):
+        clipping_parameter = median / norms[i]
+        clipping_parameter = (clipping_parameter < 1).if_else(
+            clipping_parameter, sfix(1)
+        )
+        clipped_updates[i] = client_values[i] * clipping_parameter * labels[i]
+
+    return clipped_updates
+
+
+def aggregate_updates(n_clients, clipped_updates, labels):
+    """
+    Aggregate the clipped updates based on cluster labels.
+    Args:
+        n_clients (int): The actual number of clients.
+        clipped_updates (sfix.Matrix): The clipped updates from clients.
+        labels (cint.Array): The cluster labels for each client.
+    Returns:
+        sfix.Array: The aggregated global model update.
+    """
+    aggregated_update = Array(MODEL_SIZE, sfix).assign_all(sfix(0))
+    honest_updates = MemValue(sfix(0))
+
+    @for_range(n_clients)
+    def _(i):
+        aggregated_update[:] += clipped_updates[i][:]
+        honest_updates.write(honest_updates.read() + labels[i])
+
+    return (honest_updates.read() > 0).if_else(
+        aggregated_update / honest_updates.read(), aggregated_update
+    )
+
+
+def calculate_noise_level(t, median, epsilon=EPSILON, delta=DELTA):
+    """
+    Calculate σ = λ.St where λ = (1/ε).√(2ln(1.25/δ))
+    Args:
+        sensitivity (float): The sensitivity of the function.
+        epsilon (float): The privacy budget.
+        delta (float): The failure probability.
+    Returns:
+        float: The noise level σ.
+    """
+    # Calculate λ = (1/ε) · √(2ln(1.25/δ))
+    ln_term = log_fx(t(1.25) / delta, math.e)
+    sqrt_term = sqrt(t(2) * ln_term)
+    lambda_val = (t(1.0) / epsilon) * sqrt_term
+
+    # Calculate σ = λ · St
+    return lambda_val * median
+
+
+def compute_adaptive_noise(adaptive_noising_level):
+    """
+    Compute adaptive noise based on the mean and standard deviation.
+    Args:
+        mean (float): The mean of the noise distribution.
+        std_dev (float): The standard deviation of the noise distribution.
+    Returns:
+        float: The computed noise value.
+    """
+    u1 = sfix.get_random(0.001, 0.999)
+    u2 = sfix.get_random(0.001, 0.999)
+
+    z0 = sqrt(-2 * log_fx(u1, math.e)) * cos(2 * math.pi * u2)
+    return adaptive_noising_level * z0
+
+
+def add_noise_to_update(n_clients, aggregated_update, adaptive_noise):
+    """
+    Add adaptive noise to the aggregated model update.
+    Args:
+        aggregated_update (sfix.Array): The aggregated global model update.
+        adaptive_noise (sfix): The adaptive noise level.
+    Returns:
+        sfix.Array: The updated global model with added noise.
+    """
+    noised_update = Array(MODEL_SIZE, sfix).assign(aggregated_update)
+
+    @for_range(n_clients)
+    def _(i):
+        noised_update[i] += compute_adaptive_noise(adaptive_noise)
+
+    return noised_update
+
+
 def main():
     # Start listening for client socket connections
     listen_for_clients(PORTNUM)
@@ -303,9 +428,26 @@ def main():
         revealed_cosine_distances = cosine_distances.reveal()
         # print_ln("Cosine distances: %s", revealed_cosine_distances)
 
-        # Cluster cosine similarities using HDBSCAN.
+        # Cluster cosine similarities using DBSCAN.
         labels = dbscan(n_clients, revealed_cosine_distances)
-        # print_ln("Labels: %s", labels.reveal_list())
+        # print_ln("Labels: %s", labels.reveal())
+
+        # Compute clipping bound (scaled median of L2 norms, since the global model is 0^n).
+        median = compute_median(n_clients, norms)
+        # print_ln("Median: %s", median.reveal())
+
+        # Clip gradients and aggregate global model update.
+        clipped_updates = clip_updates(n_clients, client_values, norms, median, labels)
+        # print_ln("Clipped updates: %s", clipped_updates.reveal())
+        aggregated_update = aggregate_updates(n_clients, clipped_updates, labels)
+        # print_ln("Aggregated update: %s", aggregated_update.reveal())
+
+        # Add adaptive noise to the model updates.
+        noise_level = calculate_noise_level(sfix, median)
+        # print_ln("Noise level: %s", noise_level.reveal())
+        noised_update = add_noise_to_update(n_clients, aggregated_update, noise_level)
+        revealed_noised_update = noised_update.reveal()
+        print_ln("Noisy aggregated update: %s", revealed_noised_update)
 
         close_connections(n_clients)
 

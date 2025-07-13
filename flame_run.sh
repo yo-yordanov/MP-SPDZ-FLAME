@@ -34,11 +34,12 @@ done
 if [ $? -eq 0 ]; then
     echo "✅ Compilation succeeded"
     Scripts/setup-ssl.sh 2
-    Scripts/setup-clients.sh 3
+    Scripts/setup-clients.sh 4
     PLAYERS=2 Scripts/mascot.sh flame &
     python Flame/flame-client.py 0 2 5 0 &
     python Flame/flame-client.py 1 2 5 0 &
-    python Flame/flame-client.py 2 2 5 1
+    python Flame/flame-client.py 2 2 5 0 &
+    python Flame/flame-client.py 3 2 5 1
 else
     echo "❌ Compilation failed"
 fi
