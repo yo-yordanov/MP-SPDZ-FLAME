@@ -1,0 +1,326 @@
+from Compiler.types import cint, Array, Matrix, MemValue, sfix
+from Compiler.library import for_range, if_, crash, for_range_multithread, print_ln
+from Compiler.mpc_math import sqrt
+
+MAX_CLIENTS = 20
+EPSILON = 0.01
+MIN_PTS = 5
+
+
+# seed: 23 ; values: 20 ; eps: 0.01 ; min_samples: 5 ; metric: cosine
+a_data = [
+    [0.517298, 0.946963],
+    [0.765460, 0.282396],
+    [0.221045, 0.686222],
+    [0.167139, 0.392442],
+    [0.618052, 0.411930],
+    [0.002465, 0.884032],
+    [0.884948, 0.300410],
+    [0.589582, 0.978427],
+    [0.845094, 0.065075],
+    [0.294744, 0.287934],
+    [0.822466, 0.626183],
+    [0.110478, 0.000529],
+    [0.942166, 0.141501],
+    [0.421597, 0.346489],
+    [0.869785, 0.428602],
+    [0.828751, 0.717852],
+    [0.119227, 0.596384],
+    [0.129756, 0.077534],
+    [0.831205, 0.464386],
+    [0.162012, 0.547975],
+]
+
+a_labels = [0, 1, 0, 0, 1, -1, 1, 0, -1, 1, 1, -1, -1, 1, 1, 1, -1, 1, 1, 0]
+
+# seed: 99 ; values: 20 ; eps: 0.01 ; min_samples: 5 ; metric: cosine
+b_data = [
+    [0.672279, 0.488078],
+    [0.825495, 0.031446],
+    [0.808050, 0.565617],
+    [0.297622, 0.046696],
+    [0.990627, 0.006826],
+    [0.769793, 0.746767],
+    [0.377439, 0.494147],
+    [0.928948, 0.395454],
+    [0.973956, 0.524415],
+    [0.093613, 0.813308],
+    [0.211687, 0.554346],
+    [0.292269, 0.816142],
+    [0.828043, 0.221577],
+    [0.644835, 0.095182],
+    [0.411663, 0.096865],
+    [0.144011, 0.212196],
+    [0.476656, 0.077614],
+    [0.235044, 0.006553],
+    [0.898644, 0.552234],
+    [0.167547, 0.928878],
+]
+
+b_labels = [1, 0, 1, 0, 0, -1, -1, 0, 1, -1, -1, -1, 0, 0, 0, -1, 0, 0, 1, -1]
+
+
+def test_array(expected, actual):
+    actual = actual.reveal()
+    expected = Array.create_from([cint(x) for x in expected])
+
+    @for_range(len(expected))
+    def _(i):
+        @if_(actual[i] != expected[i])
+        def fail():
+            print_ln("Unexpected entry at index %s", i)
+            print_ln("Expected:")
+            expected.print_reveal_nested()
+            print_ln("Actual:")
+            actual.print_reveal_nested()
+
+            crash()
+
+
+def compute_l2_norms(n_clients, client_values, n_threads=1, n_parallel=1):
+    """
+    Compute the L2 norms of the input vectors for each client.
+    Args:
+        n_clients (int): The actual number of clients.
+        client_values (sfix.Matrix): The input vectors from the clients.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        sfix.Array: An array containing the L2 norms for each client.
+    """
+    norms = Array(MAX_CLIENTS, sfix)
+
+    @for_range_multithread(n_threads, n_parallel, n_clients)
+    def _(cid):
+        norm = client_values[cid].dot(client_values[cid])[0]
+        norms[cid] = sqrt(norm)
+
+    return norms
+
+
+def compute_cosine_distances(
+    n_clients, client_values, norms, n_threads=1, n_parallel=1
+):
+    """
+    Compute the cosine distances between client input vectors.
+    Args:
+        n_clients (int): The actual number of clients.
+        client_values (sfix.Matrix): The input vectors from the clients.
+        norms (sfix.Array): The L2 norms of the input vectors.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        sfix.Matrix: A matrix containing the cosine distances for each client pair.
+    """
+    cos_distances = Matrix(MAX_CLIENTS, MAX_CLIENTS, sfix)
+
+    @for_range_multithread(n_threads, n_parallel, n_clients)
+    def _(i):
+        @for_range(i, n_clients)
+        def _(j):
+            cos_dist = sfix(1) - client_values[i].dot(client_values[j])[0] / (
+                norms[i] * norms[j]
+            )
+            cos_distances[i][j] = cos_distances[j][i] = cos_dist
+
+    return cos_distances
+
+
+def dbscan_init(
+    t,
+    n_clients,
+    cosine_distances,
+    n_threads=1,
+    n_parallel=1,
+):
+    """
+    Initialize the DBSCAN algorithm variables.
+    Args:
+        t (type): The type to use for the arrays (sint or cfix).
+        n_clients (int): The actual number of clients.
+        cosine_distances (sfix.Matrix): The matrix of cosine distances between clients.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        tuple: A tuple containing initialized arrays for labels, visited, neighbors, neighbor_counts, and cluster_id.
+    """
+    labels = Array(MAX_CLIENTS, t).assign_all(t(-1))
+    visited = Array(MAX_CLIENTS, t).assign_all(t(0))
+    neighbors = Matrix(MAX_CLIENTS, MAX_CLIENTS, t).assign_all(t(0))
+    neighbor_counts = Array(MAX_CLIENTS, t).assign_all(t(0))
+
+    # Precompute neighbors matrix and neighbor_counts array using multithreading
+    @for_range_multithread(n_threads, n_parallel, n_clients)
+    def _(i):
+        @for_range(n_clients)
+        def _(j):
+            is_neighbor = cosine_distances[i][j] < EPSILON
+            neighbors[i][j] = is_neighbor
+            neighbor_counts[i] = neighbor_counts[i] + is_neighbor
+
+    # Use MemValue for cluster_id to handle modifications properly
+    cluster_id = MemValue(t(-1))
+
+    return labels, visited, neighbors, neighbor_counts, cluster_id
+
+
+def queue_init(t, start_point):
+    """
+    Initialize the queue for BFS in the DBSCAN algorithm.
+    Args:
+        t (type): The type to use for the queue (sint or cfix).
+        start_point (int): The index of the starting point for the cluster expansion.
+    Returns:
+        tuple: A tuple containing the initialized queue array, queue_head, queue_tail, and in_queue array.
+    """
+    queue = t.Array(MAX_CLIENTS)
+    queue_head = MemValue(t(0))
+    queue_tail = MemValue(t(1))
+    in_queue = t.Array(MAX_CLIENTS).assign_all(t(0))
+
+    # Add starting point to queue
+    queue[0] = start_point
+    in_queue[start_point] = t(1)
+
+    return queue, queue_head, queue_tail, in_queue
+
+
+def process_queue_item(
+    n_clients,
+    labels,
+    visited,
+    neighbors,
+    neighbor_counts,
+    current_cluster,
+    queue,
+    queue_head,
+    queue_tail,
+    in_queue,
+):
+    """
+    Process an item from the queue in the DBSCAN algorithm.
+    Args:
+        n_clients (int): The actual number of clients.
+        labels (cint.Array): The array of cluster labels.
+        visited (cint.Array): The array indicating whether a point has been visited.
+        neighbors (cint.Matrix): The matrix indicating neighbor relationships.
+        neighbor_counts (cint.Array): The array of neighbor counts for each point.
+        current_cluster (int): The current cluster ID being expanded.
+        queue (cint.Array): The queue of points to process.
+        queue_head (MemValue): The head index of the queue.
+        queue_tail (MemValue): The tail index of the queue.
+        in_queue (cint.Array): The array indicating whether a point is in the queue.
+    """
+    current_point = queue[queue_head.read()]
+    queue_head.write(queue_head.read() + 1)
+
+    # Check all neighbors of current point
+    @for_range(n_clients)
+    def _(j):
+        is_neighbor = neighbors[current_point][j]
+        not_labeled = labels[j] == -1
+        is_core = neighbor_counts[j] >= MIN_PTS
+        not_in_queue = in_queue[j] == 0
+
+        # Label neighbor if it's unlabeled
+        @if_(is_neighbor * not_labeled)
+        def label_neighbor():
+            labels[j] = current_cluster
+
+        # Mark as visited if it's a neighbor
+        @if_(is_neighbor)
+        def mark_visited():
+            visited[j] = cint(1)
+
+        # Add to queue if it's a core point and not already in queue
+        @if_(is_neighbor * not_labeled * is_core * not_in_queue)
+        def add_to_queue():
+            current_tail = queue_tail.read()
+            queue[current_tail] = j
+            in_queue[j] = cint(1)
+            queue_tail.write(current_tail + 1)
+
+
+def dbscan(
+    n_clients,
+    cosine_distances,
+    n_threads=1,
+    n_parallel=1,
+):
+    """
+    Perform the DBSCAN clustering algorithm on the revealed cosine distances.
+    Args:
+        n_clients (int): The actual number of clients.
+        cosine_distances (sfix.Matrix): The matrix of cosine distances between clients.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        cint.Array: An array containing the cluster labels for each client.
+    """
+    # Initialize DBSCAN parameters
+    labels, visited, neighbors, neighbor_counts, cluster_id = dbscan_init(
+        cint,
+        n_clients,
+        cosine_distances,
+        n_threads,
+        n_parallel,
+    )
+
+    @for_range(n_clients)
+    def _(i):
+        # Check if point should start a new cluster
+        should_expand = (visited[i] == 0) * (neighbor_counts[i] >= MIN_PTS)
+
+        @if_(should_expand)
+        def expand_cluster():
+            visited[i] = cint(1)
+            current_cluster = cluster_id.read() + 1
+            cluster_id.write(current_cluster)
+
+            # Initialize queue for BFS and add the current point
+            queue, queue_head, queue_tail, in_queue = queue_init(cint, i)
+            labels[i] = current_cluster
+
+            # Process queue
+            @for_range(n_clients)  # Upper bound for queue processing
+            def _(iteration):
+                head = queue_head.read()
+                tail = queue_tail.read()
+
+                # Check if queue is not empty
+                @if_(head < tail)
+                def _():
+                    process_queue_item(
+                        n_clients,
+                        labels,
+                        visited,
+                        neighbors,
+                        neighbor_counts,
+                        current_cluster,
+                        queue,
+                        queue_head,
+                        queue_tail,
+                        in_queue,
+                    )
+
+    return labels
+
+
+a_converted = Matrix.create_from([[sfix(x) for x in row] for row in a_data])
+a_norms = compute_l2_norms(MAX_CLIENTS, a_converted)
+a_cosine_distances = compute_cosine_distances(MAX_CLIENTS, a_converted, a_norms)
+a_cint_labels = dbscan(
+    MAX_CLIENTS,
+    a_cosine_distances.reveal(),
+)
+
+b_converted = Matrix.create_from([[sfix(x) for x in row] for row in b_data])
+b_norms = compute_l2_norms(MAX_CLIENTS, b_converted)
+b_cosine_distances = compute_cosine_distances(MAX_CLIENTS, b_converted, b_norms)
+b_cint_labels = dbscan(
+    MAX_CLIENTS,
+    b_cosine_distances.reveal(),
+)
+
+test_array(a_labels, a_cint_labels)
+test_array(b_labels, b_cint_labels)

@@ -26,7 +26,7 @@ PRECISION = 32
 sfix.set_precision(PRECISION)
 cfix.set_precision(PRECISION)
 
-EPSILON = MemValue(cfix(0.6))
+EPSILON = MemValue(cfix(0.3))
 DELTA = MemValue(sfix(1e-5))
 MIN_PTS = MemValue(cint(MAX_CLIENTS // 2 + 1))
 LEARNING_RATE = MemValue(sfix(0.1))
@@ -116,12 +116,40 @@ def client_input(n_clients, n_threads=N_THREADS, n_parallel=1):
     return client_values
 
 
-def compute_l2_norms(n_clients, values, n_threads=N_THREADS, n_parallel=1):
+def compute_euclidean_distances(
+    n_clients, client_values, global_model, n_threads=N_THREADS, n_parallel=1
+):
+    """
+    Compute the Euclidean distances between two sets of client input vectors.
+    Args:
+        n_clients (int): The actual number of clients.
+        client_values (sfix.Matrix): The set of input vectors from the clients.
+        global_model (sfix.Array): The global model vector.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        sfix.Array: A matrix containing the Euclidean distances for each client and the global model.
+    """
+    distances = Array(MAX_CLIENTS, sfix).assign_all(sfix(0))
+
+    @for_range(n_clients)
+    def _(i):
+        diff = Array(MODEL_SIZE, sfix).assign(client_values[i] - global_model)
+        # print_ln("Client diff: %s", diff.reveal())
+        dist = diff.dot(diff)[0]
+        # print_ln("Client distance: %s", dist.reveal())
+        distances[i] = sqrt(dist)
+        # print_ln("Client Euclidean distance: %s", distances[i].reveal())
+
+    return distances
+
+
+def compute_l2_norms(n_clients, client_values, n_threads=1, n_parallel=1):
     """
     Compute the L2 norms of the input vectors for each client.
     Args:
         n_clients (int): The actual number of clients.
-        values (sfix.Matrix): The input vectors from the clients.
+        client_values (sfix.Matrix): The input vectors from the clients.
         n_threads (int): The number of threads to use for parallel processing.
         n_parallel (int): The number of parallel operations to perform.
     Returns:
@@ -131,39 +159,47 @@ def compute_l2_norms(n_clients, values, n_threads=N_THREADS, n_parallel=1):
 
     @for_range_multithread(n_threads, n_parallel, n_clients)
     def _(cid):
-        norm = values[cid].dot(values[cid])[0]
+        norm = client_values[cid].dot(client_values[cid])[0]
         norms[cid] = sqrt(norm)
 
     return norms
 
 
 def compute_cosine_distances(
-    n_clients, values, norms, n_threads=N_THREADS, n_parallel=1
+    n_clients, client_values, norms, n_threads=1, n_parallel=1
 ):
     """
     Compute the cosine distances between client input vectors.
     Args:
         n_clients (int): The actual number of clients.
-        values (sfix.Matrix): The input vectors from the clients.
+        client_values (sfix.Matrix): The input vectors from the clients.
         norms (sfix.Array): The L2 norms of the input vectors.
         n_threads (int): The number of threads to use for parallel processing.
         n_parallel (int): The number of parallel operations to perform.
     Returns:
         sfix.Matrix: A matrix containing the cosine distances for each client pair.
     """
-    cos_distances = Matrix(MAX_CLIENTS, MAX_CLIENTS, sfix).assign_all(sfix(0))
+    cos_distances = Matrix(MAX_CLIENTS, MAX_CLIENTS, sfix)
 
     @for_range_multithread(n_threads, n_parallel, n_clients)
     def _(i):
-        @for_range(i + 1, n_clients)
+        @for_range(i, n_clients)
         def _(j):
-            cos_dist = sfix(1) - values[i].dot(values[j])[0] / (norms[i] * norms[j])
+            cos_dist = sfix(1) - client_values[i].dot(client_values[j])[0] / (
+                norms[i] * norms[j]
+            )
             cos_distances[i][j] = cos_distances[j][i] = cos_dist
 
     return cos_distances
 
 
-def dbscan_init(t, n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
+def dbscan_init(
+    t,
+    n_clients,
+    cosine_distances,
+    n_threads=1,
+    n_parallel=1,
+):
     """
     Initialize the DBSCAN algorithm variables.
     Args:
@@ -175,7 +211,7 @@ def dbscan_init(t, n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=
     Returns:
         tuple: A tuple containing initialized arrays for labels, visited, neighbors, neighbor_counts, and cluster_id.
     """
-    labels = Array(MAX_CLIENTS, t).assign_all(t(0))
+    labels = Array(MAX_CLIENTS, t).assign_all(t(-1))
     visited = Array(MAX_CLIENTS, t).assign_all(t(0))
     neighbors = Matrix(MAX_CLIENTS, MAX_CLIENTS, t).assign_all(t(0))
     neighbor_counts = Array(MAX_CLIENTS, t).assign_all(t(0))
@@ -185,17 +221,99 @@ def dbscan_init(t, n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=
     def _(i):
         @for_range(n_clients)
         def _(j):
-            is_neighbor = (i != j) * (cosine_distances[i][j] < EPSILON)
+            is_neighbor = cosine_distances[i][j] < EPSILON
             neighbors[i][j] = is_neighbor
             neighbor_counts[i] = neighbor_counts[i] + is_neighbor
 
     # Use MemValue for cluster_id to handle modifications properly
-    cluster_id = MemValue(t(0))
+    cluster_id = MemValue(t(-1))
 
     return labels, visited, neighbors, neighbor_counts, cluster_id
 
 
-def dbscan(n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
+def queue_init(t, start_point):
+    """
+    Initialize the queue for BFS in the DBSCAN algorithm.
+    Args:
+        t (type): The type to use for the queue (sint or cfix).
+        start_point (int): The index of the starting point for the cluster expansion.
+    Returns:
+        tuple: A tuple containing the initialized queue array, queue_head, queue_tail, and in_queue array.
+    """
+    queue = t.Array(MAX_CLIENTS)
+    queue_head = MemValue(t(0))
+    queue_tail = MemValue(t(1))
+    in_queue = t.Array(MAX_CLIENTS).assign_all(t(0))
+
+    # Add starting point to queue
+    queue[0] = start_point
+    in_queue[start_point] = t(1)
+
+    return queue, queue_head, queue_tail, in_queue
+
+
+def process_queue_item(
+    n_clients,
+    labels,
+    visited,
+    neighbors,
+    neighbor_counts,
+    current_cluster,
+    queue,
+    queue_head,
+    queue_tail,
+    in_queue,
+):
+    """
+    Process an item from the queue in the DBSCAN algorithm.
+    Args:
+        n_clients (int): The actual number of clients.
+        labels (cint.Array): The array of cluster labels.
+        visited (cint.Array): The array indicating whether a point has been visited.
+        neighbors (cint.Matrix): The matrix indicating neighbor relationships.
+        neighbor_counts (cint.Array): The array of neighbor counts for each point.
+        current_cluster (int): The current cluster ID being expanded.
+        queue (cint.Array): The queue of points to process.
+        queue_head (MemValue): The head index of the queue.
+        queue_tail (MemValue): The tail index of the queue.
+        in_queue (cint.Array): The array indicating whether a point is in the queue.
+    """
+    current_point = queue[queue_head.read()]
+    queue_head.write(queue_head.read() + 1)
+
+    # Check all neighbors of current point
+    @for_range(n_clients)
+    def _(j):
+        is_neighbor = neighbors[current_point][j]
+        not_labeled = labels[j] == -1
+        is_core = neighbor_counts[j] >= MIN_PTS
+        not_in_queue = in_queue[j] == 0
+
+        # Label neighbor if it's unlabeled
+        @if_(is_neighbor * not_labeled)
+        def label_neighbor():
+            labels[j] = current_cluster
+
+        # Mark as visited if it's a neighbor
+        @if_(is_neighbor)
+        def mark_visited():
+            visited[j] = cint(1)
+
+        # Add to queue if it's a core point and not already in queue
+        @if_(is_neighbor * not_labeled * is_core * not_in_queue)
+        def add_to_queue():
+            current_tail = queue_tail.read()
+            queue[current_tail] = j
+            in_queue[j] = cint(1)
+            queue_tail.write(current_tail + 1)
+
+
+def dbscan(
+    n_clients,
+    cosine_distances,
+    n_threads=1,
+    n_parallel=1,
+):
     """
     Perform the DBSCAN clustering algorithm on the revealed cosine distances.
     Args:
@@ -208,7 +326,11 @@ def dbscan(n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
     """
     # Initialize DBSCAN parameters
     labels, visited, neighbors, neighbor_counts, cluster_id = dbscan_init(
-        cint, n_clients, cosine_distances, n_threads, n_parallel
+        cint,
+        n_clients,
+        cosine_distances,
+        n_threads,
+        n_parallel,
     )
 
     @for_range(n_clients)
@@ -222,15 +344,8 @@ def dbscan(n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
             current_cluster = cluster_id.read() + 1
             cluster_id.write(current_cluster)
 
-            # Initialize queue for BFS
-            queue = cint.Array(MAX_CLIENTS)
-            queue_head = MemValue(cint(0))
-            queue_tail = MemValue(cint(1))
-            in_queue = cint.Array(MAX_CLIENTS).assign_all(cint(0))
-
-            # Add starting point to queue
-            queue[0] = i
-            in_queue[i] = cint(1)
+            # Initialize queue for BFS and add the current point
+            queue, queue_head, queue_tail, in_queue = queue_init(cint, i)
             labels[i] = current_cluster
 
             # Process queue
@@ -241,36 +356,19 @@ def dbscan(n_clients, cosine_distances, n_threads=N_THREADS, n_parallel=1):
 
                 # Check if queue is not empty
                 @if_(head < tail)
-                def process_queue_item():
-                    current_point = queue[head]
-                    queue_head.write(head + 1)
-
-                    # Check all neighbors of current point
-                    @for_range(n_clients)
-                    def _(j):
-                        is_neighbor = neighbors[current_point][j]
-                        not_labeled = labels[j] == 0
-                        not_in_queue = in_queue[j] == 0
-
-                        # Label neighbor if it's unlabeled
-                        should_label = is_neighbor * not_labeled
-                        labels[j] = labels[j] + should_label * current_cluster
-
-                        # Mark as visited if it's a neighbor
-                        visited[j] = visited[j] + is_neighbor * (1 - visited[j])
-
-                        # Add to queue if it's a core point and not already in queue
-                        is_core = neighbor_counts[j] >= MIN_PTS
-                        should_add_to_queue = should_label * is_core * not_in_queue
-
-                        # Oblivious queue addition
-                        current_tail = queue_tail.read()
-
-                        @if_(should_add_to_queue)
-                        def add_to_queue():
-                            queue[current_tail] = j
-                            in_queue[j] = cint(1)
-                            queue_tail.write(current_tail + 1)
+                def _():
+                    process_queue_item(
+                        n_clients,
+                        labels,
+                        visited,
+                        neighbors,
+                        neighbor_counts,
+                        current_cluster,
+                        queue,
+                        queue_head,
+                        queue_tail,
+                        in_queue,
+                    )
 
     return labels
 
@@ -317,7 +415,7 @@ def clip_updates(
     Returns:
         sfix.Array: The aggregated global model update.
     """
-    clipped_updates = Matrix(MAX_CLIENTS, MODEL_SIZE, sfix)
+    clipped_updates = Matrix(MAX_CLIENTS, MODEL_SIZE, sfix).assign_all(sfix(0))
 
     @for_range_multithread(n_threads, n_parallel, n_clients)
     def _(i):
@@ -325,7 +423,10 @@ def clip_updates(
         clipping_parameter = (clipping_parameter < 1).if_else(
             clipping_parameter, sfix(1)
         )
-        clipped_updates[i] = client_values[i] * clipping_parameter * labels[i]
+
+        @if_(labels[i] >= 0)
+        def _():
+            clipped_updates[i] = client_values[i] * clipping_parameter
 
     return clipped_updates
 
@@ -407,6 +508,13 @@ def add_noise_to_update(n_clients, aggregated_update, adaptive_noise):
 
 
 def main():
+    """
+    Main function to run the FLAME protocol.
+    It listens for client connections, accepts inputs, computes L2 norms,
+    computes cosine distances, clusters the inputs using DBSCAN,
+    computes clipping bounds, clips gradients, aggregates updates,
+    and adds adaptive noise to the global model update.
+    """
     # Start listening for client socket connections
     listen_for_clients(PORTNUM)
     print_ln("Listening for client connections on base port %s", PORTNUM)
@@ -421,7 +529,6 @@ def main():
 
         # Compute L2 norm of each client's input.
         norms = compute_l2_norms(n_clients, client_values)
-        # print_ln("L2 norms: %s", norms.reveal_list())
 
         # Compute pairwise cosine distances.
         cosine_distances = compute_cosine_distances(n_clients, client_values, norms)
@@ -447,7 +554,7 @@ def main():
         # print_ln("Noise level: %s", noise_level.reveal())
         noised_update = add_noise_to_update(n_clients, aggregated_update, noise_level)
         revealed_noised_update = noised_update.reveal()
-        print_ln("Noisy aggregated update: %s", revealed_noised_update)
+        print_ln("Global model update: %s", revealed_noised_update)
 
         close_connections(n_clients)
 
