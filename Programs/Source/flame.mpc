@@ -379,18 +379,59 @@ def compute_median(n_clients, norms):
     Args:
         n_clients (int): The actual number of clients.
         norms (sfix.Array): The L2 norms of the input vectors.
-        lr (sfix): The learning rate to scale the median.
     Returns:
         MemValue: The median value of the L2 norms, scaled by the learning rate.
     """
-    sorted_norms = Array(MAX_CLIENTS, sfix).assign(norms)
-    sorted_norms.sort()
-    median_index = (n_clients) // 2
+    # Compute comparison matrix between each pair of norms and store the sum in the last column
+    comparison_matrix = Matrix(MAX_CLIENTS, MAX_CLIENTS + 1, sint)
 
-    odd_median = sorted_norms[median_index]
-    even_median = (sorted_norms[median_index - 1] + sorted_norms[median_index]) / 2
+    @for_range(n_clients)
+    def _(i):
+        @for_range(n_clients)
+        def _(j):
+            @if_(i != j)
+            def _():
+                comparison_matrix[i][j] = norms[i] > norms[j]
 
-    return MemValue((n_clients % 2 == 1).if_else(odd_median, even_median))
+    revealed_comparison_matrix = comparison_matrix.reveal()
+
+    # Store sums and indices in a two matrices
+    row_sums = Array(MAX_CLIENTS, cint).assign_all(cint(0))
+    indices = Array(MAX_CLIENTS, cint)
+
+    @for_range(n_clients)
+    def _(i):
+        @for_range(n_clients)
+        def _(j):
+            row_sums[i] += revealed_comparison_matrix[i][j]
+
+        indices[i] = cint(i)
+
+    # Sort the indices using selection sort
+    @for_range(n_clients - 1)
+    def _(i):
+        min_index = MemValue(cint(i))
+
+        @for_range(i + 1, n_clients)
+        def _(j):
+            @if_(row_sums[j] < row_sums[min_index])
+            def _():
+                min_index.write(cint(j))
+
+        # Swap the indices
+        indices[i], indices[min_index] = indices[min_index], indices[i]
+        row_sums[i], row_sums[min_index] = row_sums[min_index], row_sums[i]
+
+    median = cint(n_clients // 2)
+    upper_median_index = indices[median]
+    lower_median_index = indices[median - 1]
+
+    return MemValue(
+        (n_clients % 2 == 1).if_else(
+            norms[upper_median_index],
+            (norms[upper_median_index] + norms[lower_median_index]) / 2,
+        )
+    )
 
 
 def clip_updates(
@@ -529,6 +570,7 @@ def main():
 
         # Compute L2 norm of each client's input.
         norms = compute_l2_norms(n_clients, client_values)
+        # print_ln("L2 norms: %s", norms.reveal())
 
         # Compute pairwise cosine distances.
         cosine_distances = compute_cosine_distances(n_clients, client_values, norms)
