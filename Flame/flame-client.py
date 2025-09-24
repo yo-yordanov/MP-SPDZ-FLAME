@@ -10,7 +10,7 @@ from domains import *
 
 import numpy as np
 
-PRECISION = 32
+PRECISION = 15
 
 client_id = int(sys.argv[1])
 n_parties = int(sys.argv[2])
@@ -32,9 +32,11 @@ def run(n, p):
         n (int): Number of weights in the model.
         p (int): Precision for the weights.
     """
-    model = [random.gauss(-1, 1) for _ in range(n)]
+    model = [random.gauss(0, 1) for _ in range(n)]
+    # print(f"Client {client_id} generated model: {model}")
     # Convert to fixed-point integer representation
     model = [int(x * (1 << p)) for x in model]
+    # print(f"Client {client_id} sending model: {model}")
     client.send_private_inputs(model)
 
 

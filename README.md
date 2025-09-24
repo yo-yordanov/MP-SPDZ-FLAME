@@ -25,15 +25,33 @@ This repository implements the FLAME (Federated Learning) protocol using Multi-P
 
 ## Quick Start
 
-The repository includes an automated setup script that handles all dependencies and environment configuration:
+The repository includes an automated setup script that handles all dependencies and environment configuration. The script will:
+- Create and activate a virtual environment and install required dependencies
+- Launch the federated learning system with the wanted variant, model size, and number of clients
+
+### Script Usage (`flame_run.sh`)
 
 ```bash
-./flame_run.sh
+./flame_run.sh <leaky|private> <model_size> <clients>
 ```
 
-This script will:
-- Create and activate a virtual environment and install required dependencies
-- Launch the federated learning system with 4 clients
+**Arguments**
+- `leaky | private`: Protocol variant (`leaky` = baseline; `private` = stricter privacy)
+- `model_size`: Positive integer (model dimensionality)
+- `clients`: Number of simulated clients (>=1)
+
+**Examples**
+```bash
+./flame_run.sh leaky 64 4
+./flame_run.sh private 128 8
+```
+
+**What it does**
+1. Creates/activates a virtual env at `local/env`
+2. Installs required Python packages (`gmpy2`, `numpy`) if missing
+3. Compiles MP-SPDZ program: `flame-<variant>-<model_size>-<clients>`
+4. Starts MPC runtime and launches client processes
+5. Cleans up background jobs on error and reports failures
 
 ## Key Features
 
