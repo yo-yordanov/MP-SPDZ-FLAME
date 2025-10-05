@@ -9,7 +9,6 @@ keys/*
 
 # Personal CONFIG file #
 ##############################
-CONFIG.mine
 config_mine.py
 
 # Temporary files #
@@ -102,6 +101,7 @@ local/
 *.sqlite
 *.data
 Persistence/*
+Flame/logs
 
 # OS generated files #
 ######################
@@ -120,6 +120,7 @@ _build/
 
 # environment
 .env
+venv/
 
 # temp doc files
 doc/readme.md

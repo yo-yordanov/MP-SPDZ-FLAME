@@ -200,6 +200,9 @@ bmr-clean:
 bankers-bonus-client.x: ExternalIO/bankers-bonus-client.o $(COMMON)
 	$(CXX) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+flame-client.x: Flame/flame-client.cpp $(COMMON)
+	$(CXX) -o $@ $(CFLAGS) $(CLIENT_INCLUDES) $^ $(LDLIBS)
+
 simple-offline.x: $(FHEOFFLINE)
 pairwise-offline.x: $(FHEOFFLINE)
 cnc-offline.x: $(FHEOFFLINE)

@@ -8,16 +8,17 @@ sys.path.append(".")
 from client import *
 from domains import *
 
-import numpy as np
+import time
 
-PRECISION = 15
+PRECISION = 16
+N_PARTIES = 2
 
 client_id = int(sys.argv[1])
-n_parties = int(sys.argv[2])
-model_size = int(sys.argv[3])
-finish = int(sys.argv[4])
+num_clients = int(sys.argv[2])
+num_inputs = int(sys.argv[3])
+finish = client_id == num_clients - 1
 
-client = Client(["localhost"] * n_parties, 14000, client_id)
+client = Client(["localhost"] * N_PARTIES, 14000, client_id)
 
 for socket in client.sockets:
     os = octetStream()
@@ -32,12 +33,19 @@ def run(n, p):
         n (int): Number of weights in the model.
         p (int): Precision for the weights.
     """
-    model = [random.gauss(0, 1) for _ in range(n)]
+    start = time.perf_counter()
+    model = [random.uniform(0, 1) for _ in range(n)]
     # print(f"Client {client_id} generated model: {model}")
+
     # Convert to fixed-point integer representation
     model = [int(x * (1 << p)) for x in model]
+
+    print(f"Sending model update to {N_PARTIES} parties")
     # print(f"Client {client_id} sending model: {model}")
     client.send_private_inputs(model)
+    end = time.perf_counter()
+    print(f"Time: {end - start:.6f} seconds")
 
 
-run(model_size, PRECISION)
+run(num_inputs, PRECISION)
+print("")

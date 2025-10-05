@@ -1,0 +1,367 @@
+# coding: latin-1
+
+from Compiler.types import sint, sfix, regint, Array, Matrix, MemValue, cint, cfix
+from Compiler.library import (
+    listen_for_clients,
+    accept_client_connection,
+    crash,
+    print_ln,
+    do_while,
+    for_range,
+    for_range_opt_multithread,
+    map_sum_simple,
+    if_,
+    start_timer,
+    stop_timer,
+    tree_reduce,
+)
+from Compiler.instructions import closeclientconnection
+from Compiler.mpc_math import sqrt, log_fx, cos
+
+import math
+
+PORTNUM = 14000
+N_THREADS = 2
+N_THREADS_LOW = 8
+N_THREADS_HIGH = 24
+PRECISION = 15
+
+# sfix.set_precision(PRECISION)
+# cfix.set_precision(PRECISION)
+
+MAX_CLIENTS = int(program.args[1]) if len(program.args) > 1 else int(10)
+MODEL_SIZE = int(program.args[2]) if len(program.args) > 2 else int(1000)
+
+EPSILON = MemValue(cfix(0.9))
+DELTA = MemValue(sfix(1e-5))
+MIN_PTS = MemValue(cint(MAX_CLIENTS // 2 + 1))
+LEARNING_RATE = MemValue(sfix(0.1))
+
+
+def accept_clients():
+    """
+    Accept clients until the maximum number of clients is reached or last client is connected.
+    Returns:
+        n_clients (MemValue): The number of clients that have connected.
+    """
+    # Clients socket id (integer).
+    sockets = Array(MAX_CLIENTS, regint)
+    # Number of clients
+    n_clients = MemValue(regint(0))
+    # Client ids to identity client
+    client_ids = Array(MAX_CLIENTS, sint)
+    # Keep track of received inputs
+    seen = Array(MAX_CLIENTS, regint).assign_all(0)
+
+    def accept_client():
+        """
+        Accept a client connection and read the client id and last flag.
+        Returns:
+            client_socket_id (int): The socket id of the connected client.
+            last (int): A flag indicating if this is the last client.
+        """
+        client_socket_id = accept_client_connection(PORTNUM)
+        last = regint.read_from_socket(client_socket_id)
+        return client_socket_id, last
+
+    @do_while
+    def _():
+        cid, last = accept_client()
+
+        @if_(cid >= MAX_CLIENTS)
+        def _():
+            print_ln("client id too high")
+            crash()
+
+        sockets[cid] = cid
+        client_ids[cid] = cid
+        seen[cid] = 1
+
+        @if_(last == 1)
+        def _():
+            n_clients.write(cid + 1)
+
+        return (sum(seen) < n_clients) + (n_clients == 0)
+
+    return n_clients
+
+
+def close_connections(number_clients):
+    """
+    Close all client connections.
+    Args:
+        number_clients (int): The number of clients that are connected.
+    """
+
+    @for_range(number_clients)
+    def _(i):
+        closeclientconnection(i)
+
+
+def client_input():
+    """
+    Receive input vectors from clients.
+    Args:
+        n_clients (int): The actual number of clients.
+        n_threads (int): The number of threads to use for parallel processing.
+        n_parallel (int): The number of parallel operations to perform.
+    Returns:
+        client_values (sfix.Matrix): A matrix containing the input vectors from the clients.
+    """
+    client_values = Matrix(MAX_CLIENTS, MODEL_SIZE, sfix)
+
+    @for_range_opt_multithread(N_THREADS_HIGH, MAX_CLIENTS)
+    def _(client_id):
+        client_values[client_id] = sfix.receive_from_client(
+            1, client_id, size=MODEL_SIZE
+        )[0]
+
+    return client_values
+
+
+def compute_median(n_clients, norms):
+    """
+    Compute the clipping parameters for the input vectors by revealing the comparison matrix of the norms.
+    Args:
+        n_clients (int): The actual number of clients.
+        norms (sfix.Array): The L2 norms of the input vectors.
+    Returns:
+        MemValue(sfix): The median value of the L2 norms, scaled by the learning rate.
+    """
+    # Compute comparison matrix between each pair of norms and store the sum in the last column
+    comparison_matrix = Matrix(MAX_CLIENTS, MAX_CLIENTS + 1, sint)
+
+    @for_range(n_clients)
+    def _(i):
+        @for_range(n_clients)
+        def _(j):
+            @if_(i != j)
+            def _():
+                comparison_matrix[i][j] = norms[i] > norms[j]
+
+    revealed_comparison_matrix = comparison_matrix.reveal()
+
+    # Store sums and indices in a two matrices
+    row_sums = Array(MAX_CLIENTS, cint).assign_all(cint(0))
+    indices = Array(MAX_CLIENTS, cint)
+
+    @for_range(n_clients)
+    def _(i):
+        @for_range(n_clients)
+        def _(j):
+            row_sums[i] += revealed_comparison_matrix[i][j]
+
+        indices[i] = cint(i)
+
+    # Sort the indices using selection sort
+    @for_range(n_clients - 1)
+    def _(i):
+        min_index = MemValue(cint(i))
+
+        @for_range(i + 1, n_clients)
+        def _(j):
+            @if_(row_sums[j] < row_sums[min_index])
+            def _():
+                min_index.write(cint(j))
+
+        # Swap the indices
+        indices[i], indices[min_index] = indices[min_index], indices[i]
+        row_sums[i], row_sums[min_index] = row_sums[min_index], row_sums[i]
+
+    median = cint(n_clients // 2)
+    upper_median_index = indices[median]
+    lower_median_index = indices[median - 1]
+
+    return MemValue(
+        (n_clients % 2 == 1).if_else(
+            norms[upper_median_index],
+            (norms[upper_median_index] + norms[lower_median_index]) / 2,
+        )
+    )
+
+
+# Start listening for client socket connections
+listen_for_clients(PORTNUM)
+print_ln("Listening for client connections on base port %s", PORTNUM)
+
+# Accept clients and read their inputs.
+n_clients = accept_clients()
+client_values = client_input()
+stop_timer(0)
+
+start_timer(1)
+
+# Compute L2 norm of each client's input.
+start_timer(2)
+norms = Array(MAX_CLIENTS, sfix)
+
+
+@for_range_opt_multithread(N_THREADS_HIGH, MAX_CLIENTS)
+def _(cid):
+    dot_product = client_values[cid].dot(client_values[cid])[0]
+    norms[cid] = sqrt(dot_product)
+
+
+stop_timer(2)
+
+# Compute pairwise cosine distances.
+# TODO: Causes "WARNING: insecure Internally called tape 3 has unknown offline data usage"- warning count corresponds to number of clients
+start_timer(3)
+cosine_distances = Matrix(MAX_CLIENTS, MAX_CLIENTS, sfix)
+
+
+@for_range_opt_multithread(N_THREADS_HIGH, MAX_CLIENTS)
+def _(i):
+    cosine_distances[i][i] = sfix(0)
+
+    @for_range(i + 1, MAX_CLIENTS)
+    def _(j):
+        dot_product = client_values[i].dot(client_values[j])[0]
+        cos_dist = sfix(1) - dot_product / (norms[i] * norms[j])
+        cosine_distances[i][j] = cosine_distances[j][i] = cos_dist
+
+
+stop_timer(3)
+
+# Cluster cosine similarities using DBSCAN.
+start_timer(4)
+t = sint
+
+labels = Array(MAX_CLIENTS, t).assign_all(t(-1))
+visited = Array(MAX_CLIENTS, t).assign_all(t(0))
+neighbors = Matrix(MAX_CLIENTS, MAX_CLIENTS, t).assign_all(t(0))
+neighbor_counts = Array(MAX_CLIENTS, t).assign_all(t(0))
+updates = Matrix(MAX_CLIENTS, MODEL_SIZE, sfix).assign_all(sfix(0))
+
+
+@for_range_opt_multithread(N_THREADS_HIGH, MAX_CLIENTS)
+def _(i):
+    @for_range(MAX_CLIENTS)
+    def _(j):
+        is_neighbor = cosine_distances[i][j] < EPSILON
+        neighbors[i][j] = is_neighbor
+        neighbor_counts[i] = neighbor_counts[i] + is_neighbor
+
+
+zeros = Array(MAX_CLIENTS, t).assign_all(t(0))
+
+
+# TODO: Fix "MacCheck Failure" when using @for_range_opt_multithread - occurs for c=30 and i=100000
+@for_range(MAX_CLIENTS)
+def _(i):
+    update = t.Array(MAX_CLIENTS).assign(
+        ((neighbor_counts[i] >= MIN_PTS).if_else(neighbors[i], zeros))
+    )
+
+    @for_range(MAX_CLIENTS)
+    def _(j):
+        visited[j] += update[j]
+
+
+@for_range_opt_multithread(N_THREADS_HIGH, MAX_CLIENTS)
+def _(i):
+    labels[i] = (visited[i] > 0).if_else(t(1), t(0))
+
+
+stop_timer(4)
+
+# Compute clipping bound (scaled median of L2 norms, since the global model is 0^n).
+start_timer(5)
+sorted_norms = Array(MAX_CLIENTS, sfix).assign(norms)
+sorted_norms.sort()
+median_index = (MAX_CLIENTS) // 2
+
+odd_median = sorted_norms[median_index]
+even_median = (sorted_norms[median_index - 1] + sorted_norms[median_index]) / 2
+
+median = MemValue(cint(MAX_CLIENTS % 2 == 1).if_else(odd_median, even_median))
+stop_timer(5)
+
+
+# Clip gradients
+start_timer(6)
+clipped_updates = Matrix(MAX_CLIENTS, MODEL_SIZE, sfix).assign_all(sfix(0))
+
+
+# TODO: Fix the following error when using @for_range_opt_multithread - occurs for c=20 and i=500000
+# /Scripts/run-common.sh: line 90: 69371 Killed                  $my_prefix $SPDZROOT/$bin $i $params 2>&1
+#      69372 Done                    | { if test "$BENCH"; then
+#     if test $i = $front_player; then
+#         tee -a $log;
+#     else
+#         cat >> $log;
+#     fi;
+# else
+#     if test $i = $front_player; then
+#         tee $log;
+#     else
+#         cat > $log;
+#     fi;
+# fi; }
+# === Party 1
+# This is probably because another party encountered a problem.
+@for_range(N_THREADS_HIGH, MAX_CLIENTS)
+def _(i):
+    clipping_parameter = median / norms[i]
+    clipped_updates[i] = labels[i] * (clipping_parameter < 1).if_else(
+        client_values[i] * clipping_parameter, client_values[i]
+    )
+
+
+stop_timer(6)
+
+# Aggregate the clipped gradients.
+start_timer(7)
+aggregated_update = Array(MODEL_SIZE, sfix).assign_all(sfix(0))
+
+
+@map_sum_simple(N_THREADS_HIGH, MAX_CLIENTS, sfix, MODEL_SIZE)
+def sum_cols(i):
+    return clipped_updates[i]
+
+
+aggregated_update = sum_cols()
+honest_updates = tree_reduce(lambda x, y: x + y, labels)
+aggregated_update = (honest_updates > 0).if_else(
+    aggregated_update / honest_updates, aggregated_update
+)
+stop_timer(7)
+
+
+# Add adaptive noise to the model updates.
+start_timer(8)
+ln_term = log_fx(cfix(1.25) / DELTA, math.e)  # λ = (1/ε) · √(2ln(1.25/δ))
+sqrt_term = sqrt(cfix(2) * ln_term)
+lambda_val = (cfix(1.0) / EPSILON) * sqrt_term
+noise_level = MemValue(sfix(lambda_val * median))  # σ = λ · St
+noised_update = Array(MODEL_SIZE, sfix).assign(aggregated_update)
+
+
+@for_range_opt_multithread(N_THREADS_HIGH, MODEL_SIZE)
+def _(i):
+    gaussian_approx = sum([sfix.get_random(-0.5, 0.5) for _ in range(12)])
+    noise = noise_level.read() * gaussian_approx
+    noised_update[i] += noise
+
+
+stop_timer(8)
+
+stop_timer(1)
+
+start_timer(9)
+close_connections(MAX_CLIENTS)
+
+
+def print_results():
+    print_ln("Client values: %s", client_values.reveal_nested())
+    print_ln("L2 norms: %s", norms.reveal())
+    print_ln("Cosine distances: %s", cosine_distances.reveal())
+    print_ln("Labels: %s", labels.reveal())
+    print_ln("Median: %s", median.reveal())
+    print_ln("Clipped updates: %s", clipped_updates.reveal())
+    print_ln("Aggregated update: %s", aggregated_update.reveal())
+    print_ln("Noise level: %s", noise_level.reveal())
+    print_ln("Global model update: %s", noised_update.reveal())
+
+
+# print_results()  # Uncomment to print intermediate results
