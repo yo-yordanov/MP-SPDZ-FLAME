@@ -202,6 +202,7 @@ def _(cid):
     norms[cid] = sqrt(dot_product)
 
 
+norms = norms.reveal()
 stop_timer(2)
 
 # Compute pairwise cosine distances.
@@ -221,11 +222,12 @@ def _(i):
         cosine_distances[i][j] = cosine_distances[j][i] = cos_dist
 
 
+cosine_distances = cosine_distances.reveal()
 stop_timer(3)
 
 # Cluster cosine similarities using DBSCAN.
 start_timer(4)
-t = sint
+t = cint
 
 labels = Array(MAX_CLIENTS, t).assign_all(t(-1))
 visited = Array(MAX_CLIENTS, t).assign_all(t(0))
@@ -274,7 +276,7 @@ median_index = (MAX_CLIENTS) // 2
 odd_median = sorted_norms[median_index]
 even_median = (sorted_norms[median_index - 1] + sorted_norms[median_index]) / 2
 
-median = MemValue(sint(MAX_CLIENTS % 2 == 1).if_else(odd_median, even_median))
+median = MemValue(cint(MAX_CLIENTS % 2 == 1).if_else(odd_median, even_median))
 stop_timer(5)
 
 

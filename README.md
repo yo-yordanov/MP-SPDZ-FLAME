@@ -2,56 +2,81 @@
 
 ## Overview
 
-This repository implements the FLAME (Federated Learning) protocol using Multi-Party Computation (MPC) for privacy preservation. The implementation is built directly inside a fork of the MP-SPDZ framework, leveraging its secure computation primitives for federated learning. All computations maintain privacy except the clustering algorithm, which uses DBSCAN instead of the original HDBSCAN for performance optimization in the MPC environment.
-
-## Architecture
-
-- **MP-SPDZ Integration**: Built as a direct fork of the MP-SPDZ repository for seamless MPC operations
-- **MPC Implementation**: All gradient computations and aggregations are performed using secure multi-party computation to ensure privacy
-- **Clustering**: DBSCAN algorithm is executed in plaintext as the bottleneck component (HDBSCAN would be computationally prohibitive in MPC)
-- **Client Simulation**: Supports federated learning with multiple clients
+This repository implements the FLAME (Federated Learning) protocol using Multi-Party Computation (MPC) for privacy preservation. The implementation is built directly inside a fork of the [MP-SPDZ framework](https://github.com/data61/MP-SPDZ), leveraging its secure computation primitives for federated learning. There are two different approaches to implementing the FLAME protocol:
+- Leaky FLAME: everything is computed privately except for the sorting and clustering algorithm, which approximates HDBSCAN using DBSCAN.
+- Private FLAME: everything including sorting and clustering is computed privately.
 
 ## Repository Structure
 
 ```
 ├── Programs/
 |   ├── Source/
-|   │   └── flame.mpc        # Main FLAME protocol implementation
+|   │   └── flame_leaky.mpc     # Leaky MPC implementation
+|   │   └── flame_private.mpc   # Private MPC implementation
 ├── Flame/
-│   └── flame-client.py      # Client implementation
-├── flame_run.sh             # Automated setup script
+│   ├── flame-client.py         # Python client
+│   ├── flame-client.cpp        # C++ client
+│   ├── setup.sh                # Setup script
+│   ├── behcmark.sh             # Benchmark script
+│   ├── run.sh                  # Run script
+│   └── logs/                   # Logs folder
 └── README.md
 ```
 
 ## Quick Start
 
+### [Setup script](./Flame/setup.sh)
+
 The repository includes an automated setup script that handles all dependencies and environment configuration. The script will:
-- Create and activate a virtual environment and install required dependencies
-- Launch the federated learning system with the wanted variant, model size, and number of clients
-
-### Script Usage (`flame_run.sh`)
+- Make the required dependencies.
+- Generate the needed certificates for MPC
+- Generate preprocessing materials for MPC
 
 ```bash
-./flame_run.sh <leaky|private> <model_size> <clients>
+./Flame/setup.sh
 ```
 
-**Arguments**
-- `leaky | private`: Protocol variant (`leaky` = baseline; `private` = stricter privacy)
-- `model_size`: Positive integer (model dimensionality)
-- `clients`: Number of simulated clients (>=1)
+---
+### [Benchmark script](./Flame/benchmark.sh)
 
-**Examples**
+The repository includes an automated benchmark script that runs the benchmark. The script will:
+
+1. Create/activate a virtual env at `local/env`
+2. Install required Python packages (`gmpy2`, `numpy`) if missing
+3. Compile the MP-SPDZ program
+4. Start MPC runtime and launch client processes (logging everything to `./Flame/logs/<variant>`)
+5. Clean up background jobs on error and report failures
+
+It includes the following options
+
+- `-b`: Target variant: private or leaky (required)
+- `-c`: Number of clients (default: 10)
+- `-i`: Number of inputs/model dimension (default: 1000)
+- `-r`: Number of repetitions (default: 1)
+- `-h`: Help
+- `-t`: Timing guide
+
+Example usage:
+
 ```bash
-./flame_run.sh leaky 64 4
-./flame_run.sh private 128 8
+# bash Flame/benchmark.sh -b (private|leaky) -c [number of clients] -i [number of inputs] -r [number of repetitions]
+
+bash Flame/benchmark.sh -b private -c 10 -i 100000 -r 5
+bash Flame/benchmark.sh -b leaky -c 20 -i 500000 -r 2
+bash Flame/benchmark.sh -h
+bash Flame/benchmark.sh -t
 ```
 
-**What it does**
-1. Creates/activates a virtual env at `local/env`
-2. Installs required Python packages (`gmpy2`, `numpy`) if missing
-3. Compiles MP-SPDZ program: `flame-<variant>-<model_size>-<clients>`
-4. Starts MPC runtime and launches client processes
-5. Cleans up background jobs on error and reports failures
+---
+### [Run script](./Flame/run.sh)
+
+The repository includes an automated run script that acts as a wrapper to run multiple configs, predefined values are the following:
+- Clients: 10, 20, 30, 40, 50
+- Parameters: 100 000, 300 000, 500 000
+
+```bash
+./Flame/run.sh
+```
 
 ## Key Features
 
@@ -64,6 +89,9 @@ The repository includes an automated setup script that handles all dependencies 
 ## Links
 
 - [FLAME MPC](/Programs/Source/flame.mpc)
-- [Flame Client](/Flame/flame-client.py)
-- [Shell Script](/flame_run.sh)
+- [Python Client](/Flame/flame-client.py)
+- [C++ Client](/Flame/flame-client.cpp)
+- [Setup Script](/Flame/setup.sh)
+- [Benchmark Script](/Flame/benchmark.sh)
+- [Run Script](/flame_run.sh)
 ---

@@ -75,8 +75,39 @@ function flame_private {
 }
 
 function flame_leaky {
-    echo "FLAME leaky benchmark not yet implemented."
-  # TODO: implement
+    NUM_CLIENTS=$1
+    NUM_INPUTS=$2
+    NUM_REP=$3
+    LOG_DIR="$LOG"/flame_leaky/
+    LOG_DIR_CLIENT="$LOG_DIR"/clients/
+    LOG_DIR_PARTIES="$LOG_DIR"/parties/
+    LOG_DIR_COMPILE="$LOG_DIR"/compile/
+    mkdir -p $LOG_DIR_CLIENT $LOG_DIR_PARTIES $LOG_DIR_COMPILE
+
+    >"$LOG_DIR_COMPILE"/compile_"$NUM_CLIENTS"_"$NUM_INPUTS".log
+    >"$LOG_DIR_PARTIES"/parties_"$NUM_CLIENTS"_"$NUM_INPUTS".log
+    for i in $(seq 0 $((NUM_CLIENTS - 1))); do
+        >"$LOG_DIR_CLIENT"/client_"$NUM_CLIENTS"_"$NUM_INPUTS"_"$i".log
+    done
+
+    echo "==> Compiling leaky FLAME for $NUM_CLIENTS clients and $NUM_INPUTS inputs."
+    ./compile.py -Y -O -I -l -R 64 flame_leaky $NUM_CLIENTS $NUM_INPUTS >> "$LOG_DIR_COMPILE"/compile_"$NUM_CLIENTS"_"$NUM_INPUTS".log 2>&1
+    echo "==> Compilation finished."
+
+    for i in $(seq 1 $NUM_REP); do
+        echo "==> Starting repetition $i/$NUM_REP for $NUM_CLIENTS clients and $NUM_INPUTS inputs."
+
+        PLAYERS=2 Scripts/spdz2k.sh flame_leaky-$NUM_CLIENTS-$NUM_INPUTS -F --batch-size 500 >> "$LOG_DIR_PARTIES"/parties_"$NUM_CLIENTS"_"$NUM_INPUTS".log 2>&1 &
+        SPDZ_PID=$!
+
+        for j in $(seq 0 $((NUM_CLIENTS - 2))); do
+            ./flame-client.x "$j" "$NUM_CLIENTS" "$NUM_INPUTS" >> "$LOG_DIR_CLIENT"/client_"$NUM_CLIENTS"_"$NUM_INPUTS"_"$j".log 2>&1 &
+        done
+        ./flame-client.x $((NUM_CLIENTS - 1)) "$NUM_CLIENTS" "$NUM_INPUTS" >> "$LOG_DIR_CLIENT"/client_"$NUM_CLIENTS"_"$NUM_INPUTS"_$(($NUM_CLIENTS - 1)).log 2>&1
+
+        wait
+        echo "==> Completed repetition $i/$NUM_REP for $NUM_CLIENTS clients and $NUM_INPUTS inputs."
+    done
 }
 
 function help {
